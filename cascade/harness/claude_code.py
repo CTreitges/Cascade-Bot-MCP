@@ -26,6 +26,8 @@ from cascade.harness.base import (
     ToolResultEvent,
     ToolUseEvent,
 )
+from cascade.pricing import compute_cost as _compute_cost
+from cascade.pricing import extract_token_counts as _extract_tokens
 
 
 # Hardcoded — User-Vorgabe 2026-05-03: alle Harness-Runs immer bypass.
@@ -127,21 +129,37 @@ class ClaudeCodeHarness:
         mtype = type(msg).__name__.lower()
 
         if "result" in mtype and "tool" not in mtype:
-            # ResultMessage am Ende — Cost + Turns + Usage
-            cost = getattr(msg, "total_cost_usd", None)
-            if cost is not None:
-                result.cost_usd = float(cost)
+            # ResultMessage am Ende — Turns, Usage (DICT, nicht Object!), Cost
             turns = getattr(msg, "num_turns", None)
             if turns is not None:
                 result.num_turns = int(turns)
-            usage_obj = getattr(msg, "usage", None)
-            if usage_obj is not None:
-                result.usage = TokenUsage(
-                    input_tokens=getattr(usage_obj, "input_tokens", 0) or 0,
-                    output_tokens=getattr(usage_obj, "output_tokens", 0) or 0,
-                    cache_creation_input_tokens=getattr(usage_obj, "cache_creation_input_tokens", 0) or 0,
-                    cache_read_input_tokens=getattr(usage_obj, "cache_read_input_tokens", 0) or 0,
-                )
+
+            # SDK gibt usage als dict (input_tokens etc.) — nicht als Object.
+            usage = getattr(msg, "usage", None)
+            counts = _extract_tokens(usage)
+            result.usage = TokenUsage(
+                input_tokens=counts["input"],
+                output_tokens=counts["output"],
+                cache_read_input_tokens=counts["cache_read"],
+                cache_creation_input_tokens=counts["cache_creation"],
+            )
+
+            # Cost: bevorzugt SDK-eigener Wert (für Anthropic akkurat).
+            # Falls 0 oder fehlt (z.B. Ollama-via-Router), eigene Berechnung
+            # via cascade.pricing als Fallback.
+            sdk_cost = getattr(msg, "total_cost_usd", None)
+            if sdk_cost is not None and float(sdk_cost) > 0:
+                result.cost_usd = float(sdk_cost)
+            else:
+                # Fallback: pricing-Tabelle. Bei Ollama-Modellen liefert
+                # die Tabelle 0.0 (Subscription-Pricing) — okay.
+                result.cost_usd = _compute_cost(usage, getattr(msg, "model", None) or "")
+                if result.cost_usd == 0.0:
+                    # Letzter Fallback: probiere model aus model_usage-dict
+                    mu = getattr(msg, "model_usage", None) or {}
+                    if isinstance(mu, dict) and mu:
+                        first_model = next(iter(mu.keys()))
+                        result.cost_usd = _compute_cost(usage, first_model)
             return
 
         if "assistantmessage" in mtype or "usermessage" in mtype:
