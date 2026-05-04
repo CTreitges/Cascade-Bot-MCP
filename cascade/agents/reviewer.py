@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 from ..claude_cli import parse_json_payload
@@ -263,6 +267,131 @@ async def call_reviewer(
             ),
             output_json=True,
             effort=s.cascade_reviewer_effort or None,
+            temperature=0.0,
+            s=s,
+        )
+        data = parse_json_payload(repaired)
+        return ReviewResult.model_validate(data)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Plan v4 Phase G — Reviewer-via-Harness (Cross-Harness fähig)
+# ──────────────────────────────────────────────────────────────────────────
+async def call_reviewer_via_harness(
+    plan: Plan,
+    diff: str,
+    *,
+    workspace_root: Path | str,
+    chat_session: dict[str, Any] | None = None,
+    check_results=None,
+    external_context: str | None = None,
+    task: str | None = None,
+    s: Settings | None = None,
+    lang: str = "de",
+    run_overrides: dict[str, Any] | None = None,
+) -> ReviewResult:
+    """Reviewer-Aufruf via cascade.harness statt agent_chat.
+
+    Vorteil ggü. call_reviewer():
+      - Reviewer kann Read/Glob/Grep im Workspace nutzen — sieht über den
+        rohen Diff hinaus, kann z.B. nachprüfen ob Tests vorhanden sind
+        oder ob eine genannte Funktion wirklich nirgends sonst gerufen
+        wird.
+      - Modell+Provider sind via RoleConfig (rolle="reviewer") frei
+        wählbar — kann anderes Modell als Implementer sein (z.B.
+        Implementer=Opus, Reviewer=Haiku → 90% Cost-Ersparnis).
+      - Cost-Tracking automatisch via cascade.pricing.
+
+    Args:
+        workspace_root: cwd für die Reviewer-Session (typisch der Cascade-
+                        Workspace nach Sub-Task-Apply).
+        chat_session:   wenn vorhanden, werden Per-Chat-Overrides gelesen
+                        (cascade.role_config.get_role_config).
+        run_overrides:  Run-Time-Override-Dict, höchste Priorität.
+
+    Returns:
+        ReviewResult — gleiche Struktur wie call_reviewer().
+    """
+    from cascade.harness import HarnessRequest, get_harness
+    from cascade.role_config import get_role_config
+
+    s = s or settings()
+    rc = get_role_config(
+        "reviewer",
+        s,
+        chat_session=chat_session,
+        run_overrides=run_overrides,
+    )
+    system = REVIEWER_SYSTEM_DE if lang == "de" else REVIEWER_SYSTEM_EN
+    base_prompt = _build_prompt(plan, diff, check_results, external_context, task=task)
+
+    # Reviewer-spezifischer Prompt-Zusatz: tool-Erlaubnis explizit machen
+    # damit der Reviewer das Repo browsen darf.
+    tool_intro = (
+        "\n\nDu hast Read/Glob/Grep/Bash zur Verfügung. Nutze sie um den "
+        "Workspace zu inspizieren — z.B. Tests prüfen, Cross-Referenzen "
+        "checken, sicherstellen dass keine alten Aufrufe stehengeblieben "
+        "sind. Antworte am Ende NUR mit der ReviewResult-JSON, eingeschlossen "
+        "in ein einziges Code-Fence ```json ... ```. KEIN sonstiger Text "
+        "nach dem JSON-Block."
+        if lang == "de"
+        else "\n\nYou have Read/Glob/Grep/Bash available. Use them to "
+        "inspect the workspace — verify tests, check cross-references, "
+        "make sure no stale call sites remain. End your reply with ONLY "
+        "the ReviewResult JSON inside one ```json ... ``` fence. No prose "
+        "after the JSON block."
+    )
+
+    harness = get_harness("claude-code")
+    req = HarnessRequest(
+        role="reviewer",
+        harness=rc.harness,
+        provider=rc.provider,
+        model=rc.model,
+        prompt=base_prompt + tool_intro,
+        system=system,
+        allowed_tools=["Read", "Glob", "Grep", "Bash"],
+        cwd=Path(workspace_root),
+        max_turns=rc.max_turns,
+        enable_subagents=False,  # Reviewer braucht KEINE Sub-Agents
+    )
+    result = await harness.run(req)
+
+    if not result.success:
+        # Fallback auf legacy agent_chat-Pfad — Garantie dass Reviewer
+        # immer ein Verdikt liefert.
+        return await call_reviewer(
+            plan, diff,
+            check_results=check_results,
+            external_context=external_context,
+            lang=lang, task=task, s=s,
+        )
+
+    raw = result.final_text or ""
+    try:
+        data = parse_json_payload(raw)
+        return ReviewResult.model_validate(data)
+    except Exception:
+        # JSON-Repair wie im legacy-Pfad: kurzer 2. Aufruf via legacy
+        # agent_chat mit deterministic temperature + Schema-Hinweis.
+        repair_prompt = (
+            "Your previous reviewer response was not valid JSON or did not "
+            "match the required ReviewResult schema. Reply with ONLY the "
+            "corrected JSON object (no prose, no fences, no markdown). "
+            "Schema:\n"
+            "  {\"pass\": bool, \"feedback\": str, "
+            "\"passing_criteria\": [str], \"failing_criteria\": [str], "
+            "\"severity\": \"low\"|\"medium\"|\"high\"}\n\n"
+            f"Original response (broken):\n{raw[:6000]}"
+        )
+        repaired = await agent_chat(
+            prompt=repair_prompt,
+            model=rc.model,
+            system_prompt=(
+                "You repair broken JSON outputs from a code-review agent. "
+                "Return ONLY a valid JSON object matching the requested schema."
+            ),
+            output_json=True,
             temperature=0.0,
             s=s,
         )
