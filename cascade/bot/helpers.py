@@ -134,7 +134,18 @@ async def send_long(message: Message, text: str, *, code: bool = False, chunk: i
     for i, piece in enumerate(pieces):
         prefix = "" if len(pieces) == 1 else f"({i + 1}/{len(pieces)})\n"
         if code:
-            await message.reply_text(f"{prefix}```\n{piece}\n```", parse_mode=ParseMode.MARKDOWN)
+            # Triple-backticks im Inhalt schließen den umrandenden Code-Block
+            # vorzeitig → Telegram parser scheitert mit "can't find end of
+            # entity". Mit Zero-Width-Space dazwischen neutralisieren —
+            # visuell unverändert.
+            safe = piece.replace("```", "``​`")
+            body = f"{prefix}```\n{safe}\n```"
+            try:
+                await message.reply_text(body, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                # Falls Markdown trotz Schutz scheitert (andere Sonderfälle):
+                # plain-text Fallback ohne parse_mode.
+                await message.reply_text(f"{prefix}{piece}")
         else:
             await message.reply_text(prefix + piece)
 

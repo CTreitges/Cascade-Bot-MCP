@@ -19,6 +19,26 @@ async def post_init(application: Application) -> None:
     store = await Store.open(s.cascade_db_path)
     application.bot_data["store"] = store
 
+    # Owner-Notification: bot frisch gestartet. Hilft beim manuellen
+    # Restart-Workflow zu sehen wann der Bot wieder ansprechbar ist
+    # (vorher musste man "Bot is typing" oder /status pingen).
+    if s.telegram_owner_id:
+        try:
+            from datetime import datetime
+            ts = datetime.now().strftime("%H:%M:%S")
+            lang = getattr(s, "cascade_bot_lang", "de")
+            text = (
+                f"🟢 Bot frisch gestartet — {ts}"
+                if lang == "de" else
+                f"🟢 Bot freshly started — {ts}"
+            )
+            await application.bot.send_message(
+                chat_id=s.telegram_owner_id,
+                text=text,
+            )
+        except Exception as e:
+            log.warning("could not send boot notification: %s", e)
+
     # Background chat-summariser: walks `chat_messages` for un-summarised
     # rows older than 7d and asks Sonnet to compress them. Best-effort —
     # crash here would NOT block the bot; we just log and skip.
@@ -78,6 +98,19 @@ async def post_init(application: Application) -> None:
         async def _resume_one(task_id: str) -> None:
             try:
                 await asyncio.sleep(15)  # grace: avoid racing with bot init
+                # Race-Check: a queued telegram /resume update or a manual
+                # /resume during the 15s grace may have already hoisted
+                # this task into TASK_REGISTRY. If so, skip — otherwise
+                # we'd spawn a parallel run_cascade against the same
+                # workspace (the "task appears twice" symptom seen on
+                # Apr 27 after /restart while b03f78 was inflight).
+                from cascade.bot.state import TASK_REGISTRY
+                if task_id in TASK_REGISTRY:
+                    log.info(
+                        "auto-resume skipped: %s already running via "
+                        "another path", task_id,
+                    )
+                    return
                 task = await store.get_task(task_id)
                 if task is None or task.status not in ("interrupted",):
                     return

@@ -544,6 +544,32 @@ async def run_cascade(
                 ws = Workspace.attach(resolved.path)
             else:
                 ws = Workspace.create(s.workspaces_dir, task_id=task_id)
+        # Stufe 3.1 — Self-Repo-Guard: wenn der Cascade-Bot auf seinem
+        # eigenen Repo (cascade_home) ohne Worktree arbeitet, kann ein
+        # gecrashter Run den live-Bot brechen. Warnung im Log + Telegram
+        # damit User-bewusst entschieden ist.
+        try:
+            cascade_root = Path(s.cascade_home).resolve()
+            ws_root_abs = Path(ws.root).resolve()
+            if ws_root_abs == cascade_root:
+                await _log(
+                    store, task_id, "warn",
+                    "⚠️ self-repo guard: workspace = cascade-bot-root "
+                    f"({cascade_root}). Implementer modifiziert das LIVE-"
+                    "Repo des laufenden Bots. Bei Edit-Erfolgen am Bot-"
+                    "Code könnte der bot-Service kaputtgehen. Empfehlung: "
+                    "git worktree erzwingen oder cascade_use_orchestrator=True.",
+                )
+                await _emit(progress, store, task_id, "log",
+                    {"msg":
+                        "⚠️ Sub-Task läuft im Live-Repo des Bots — "
+                        "vorsichtig editieren!"
+                        if lang == "de" else
+                        "⚠️ sub-task running in bot's live repo — edit with care!"
+                    })
+        except Exception:
+            pass
+
         await store.update_task(task_id, workspace_path=str(ws.root), status="running")
 
         # Only re-record iteration 0 on a fresh run — on resume we already
@@ -756,6 +782,16 @@ async def run_cascade(
                 # "cannot proceed without read access" — feeding it more
                 # iterations only burns tokens. Force a replan instead.
                 empty_ops_consec = 0
+                # Plan-v4 Stufe-1.1 — Stagnation bei identisch wiederholtem
+                # op-fail: wenn Iter N und Iter N-1 die EXAKT selbe Liste
+                # gefailter Ops haben (gleiche signature aus op|path|
+                # detail-prefix), zählt das als Stagnations-Marker.
+                # Beim ersten Wiederholungs-fall (N=2 mit gleicher sig)
+                # wird sub_consec_fails sofort auf threshold gehoben →
+                # Replan triggert. Verhindert Lock-In wo der Implementer
+                # den exakten gescheiterten Edit-Op endlos wiederholt.
+                last_failed_ops_signature: tuple = ()
+                same_op_fail_consec = 0
                 # Paths the reviewer named in its most recent feedback —
                 # kept across replans so the first post-replan iter still
                 # sees the files the reviewer pointed at, even though
@@ -923,6 +959,34 @@ async def run_cascade(
                     else:
                         op_failure_block = None
 
+                    # Stagnation bei identisch wiederholtem op-fail:
+                    # signature = sortierte Tuple aus (op, path, detail-prefix).
+                    cur_op_sig = tuple(sorted(
+                        (r.op, r.path, (r.detail or "")[:120])
+                        for r in (failed_results or [])
+                    ))
+                    if cur_op_sig and cur_op_sig == last_failed_ops_signature:
+                        same_op_fail_consec += 1
+                        if (
+                            same_op_fail_consec >= 1
+                            and sub_replans < s.cascade_replan_max
+                        ):
+                            await _log(
+                                store, task_id, "warn",
+                                f"identische op-fails 2× in Folge "
+                                f"({len(failed_results)} ops) — escaliere zu "
+                                f"replan statt iter {cumulative_iter+1}",
+                            )
+                            # Bump auf threshold damit Replan-Block triggert
+                            sub_consec_fails = max(
+                                sub_consec_fails,
+                                s.cascade_replan_after_failures,
+                            )
+                            same_op_fail_consec = 0
+                    else:
+                        same_op_fail_consec = 0
+                    last_failed_ops_signature = cur_op_sig
+
                     # quality checks (sub-plan's)
                     check_results = []
                     for chk in sub_plan.quality_checks:
@@ -993,6 +1057,31 @@ async def run_cascade(
                         sub_feedback = (
                             f"{op_failure_block}\n\nREVIEWER:\n{review.feedback}"
                             if review.feedback else op_failure_block
+                        )
+
+                    # Stufe 3.3 — Strategy-Switch-Hint bei identisch
+                    # wiederholtem op-fail (vor Replan-Trigger).
+                    # Implementer im JSON-Pfad sieht nicht von selbst dass
+                    # er den exakten Fail wiederholt — explizit instruieren.
+                    if same_op_fail_consec >= 1 and op_failure_block:
+                        sub_feedback = (
+                            sub_feedback or ""
+                        ) + (
+                            "\n\n⚠️ STRATEGY-SWITCH ERFORDERLICH:\n"
+                            "  Du hast den/die selben Edit-Op(s) zum 2. Mal "
+                            "in Folge mit identischer Fehlermeldung erzeugt. "
+                            "Das wird beim erneuten Versuch wieder scheitern.\n"
+                            "  Wechsle die Strategie:\n"
+                            "    1) Lies den AKTUELLEN Datei-Inhalt aus "
+                            "EXISTING FILE CONTENTS und nimm DEN exakten "
+                            "Wortlaut für deinen find-String — kein "
+                            "approximierter / aus dem Kopf zitierter Text.\n"
+                            "    2) Wenn die Änderung mehr als 30% der "
+                            "Datei betrifft → nutze 'write' (ganze Datei "
+                            "neu) statt 'edit' (find/replace).\n"
+                            "    3) Falls du dir nicht sicher bist welche "
+                            "Datei den Code wirklich enthält → frag im "
+                            "Plan-Replan nach besseren files_to_touch."
                         )
                     # Snapshot the paths the reviewer named for the next
                     # iter — survives replan reset of sub_feedback.
@@ -2273,6 +2362,46 @@ def _build_replan_feedback(prev_plan: Plan, iter_history: list) -> str:
         "should make those fixes part of the steps / acceptance, not "
         "leave them implicit."
     )
+
+    # Stufe 1.2 — Op-Fail-Pattern-Erkennung über die iter_history.
+    # Wenn die letzten 2 Iterationen identische op-fails hatten, geben wir
+    # dem Planner einen konkreten Strategie-Wechsel-Hinweis.
+    op_fail_signs = []
+    for it in keep[-2:]:
+        fb = (it.reviewer_feedback or "")
+        if "find string not found" in fb.lower() or "OP FAILURES" in fb:
+            op_fail_signs.append(it.n)
+    if len(op_fail_signs) >= 2:
+        lines.append(
+            "\n⚠️ STRATEGIE-WECHSEL EMPFOHLEN — der Implementer ist beim "
+            "selben Edit-Op 2× hintereinander gescheitert (z.B. "
+            "'find string not found'). Mögliche Ursachen + Empfehlungen:"
+            "\n  - find-String passt nicht exakt: schreibe steps so dass "
+            "der Implementer ZUERST den Datei-Inhalt liest und mit dem "
+            "EXAKTEN aktuellen Wortlaut arbeitet."
+            "\n  - Bei mehr als ~30% Veränderungen pro Datei: nutze "
+            "'write' (ganze Datei neu) statt 'edit' (find/replace)."
+            "\n  - files_to_touch evtl. falsch — die Funktion lebt in "
+            "einer anderen Datei als der Plan vermutet."
+        )
+
+    # Stufe 1.3 — Quality-Check-Verstärkung.
+    # Wenn Reviewer pass=false trotz Quality-Checks ✅, dann sind die Checks
+    # zu schwach — geben dem Planner einen Hint sie strenger zu formulieren.
+    if keep:
+        latest = keep[-1]
+        if latest.reviewer_pass is False:
+            lines.append(
+                "\n⚠️ QUALITY-CHECKS verstärken — der Reviewer hat pass=false "
+                "obwohl die Quality-Checks alle grün waren. Das heißt deine "
+                "Checks prüfen 'existiert' statt 'wurde geändert'. Beispiele "
+                "für stärkere Patterns:"
+                "\n  - statt 'grep PATTERN file' → 'git diff HEAD -- file | "
+                "grep -E ^[+-].*PATTERN' (prüft Änderung, nicht Vorhandensein)"
+                "\n  - statt Zeilen-Zähler → konkrete neue Section-Marker / "
+                "Funktions-Namen / Kommentar-Tags die nur in der NEUEN "
+                "Implementierung vorkommen können"
+            )
     return "\n".join(lines)
 
 

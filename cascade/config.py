@@ -138,6 +138,13 @@ class Settings(BaseSettings):
     cascade_skill_suggest_cooldown_s: int = 300
     cascade_workspace_retention_days: int = 7
 
+    # ── Robustheit: Replan-Hard-Cap (Stufe 3.2) ───────────────────────
+    # Hard-Timeout um Replan-LLM-Calls in Sekunden. Default 600 (10min) —
+    # fängt echte Hänger ohne legitime LLM-Latency zu killen. Wenn der
+    # Replan länger braucht, wird er abgebrochen + sub-task macht weiter
+    # mit dem alten Plan (best-effort) statt im replanning-Status zu hängen.
+    cascade_replan_max_wait_s: int = 600
+
     # ── Plan v4 Feature-Flags (opt-in) ────────────────────────────────
     # Wenn True: cascade.orchestrator (Phase E) nutzen statt der existing
     # serial-sub-task-Schleife. Ermöglicht parallele Sub-Tasks via git

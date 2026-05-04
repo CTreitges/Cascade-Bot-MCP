@@ -18,7 +18,7 @@ IMPLEMENTER_MODELS: dict[str, tuple[str, str]] = {
     "glm-5.1":           ("GLM 5.1", "ollama"),
     "kimi-k2.6":         ("Kimi K2.6", "ollama"),
     "minimax-m2.7":      ("MiniMax M2.7", "ollama"),
-    "deepseek-v4-flash": ("DeepSeek V4 Flash", "ollama"),
+    "deepseek-v4-pro:cloud": ("DeepSeek V4 Pro", "ollama"),
     "claude-sonnet-4-6": ("Claude Sonnet 4.6", "claude"),
     "claude-opus-4-7":   ("Claude Opus 4.7", "claude"),
 }
@@ -31,7 +31,7 @@ IMPLEMENTER_CTX: dict[str, int] = {
     "qwen3.5:397b":      256_000,
     "glm-5.1":           200_000,
     "minimax-m2.7":      256_000,
-    "deepseek-v4-flash": 128_000,
+    "deepseek-v4-pro:cloud": 160_000,
     "kimi-k2.6":         256_000,
     # generous default for any newer / unlisted tag
 }
@@ -47,7 +47,7 @@ PLANNER_REVIEWER_MODELS: dict[str, str] = {
     "glm-5.1":           "GLM 5.1",
     "kimi-k2.6":         "Kimi K2.6",
     "minimax-m2.7":      "MiniMax M2.7",
-    "deepseek-v4-flash": "DeepSeek V4 Flash",
+    "deepseek-v4-pro:cloud": "DeepSeek V4 Pro",
 }
 
 
@@ -81,7 +81,7 @@ CHAT_MODELS: dict[str, str] = {
     "glm-5.1":           "GLM 5.1",
     "kimi-k2.6":         "Kimi K2.6",
     "minimax-m2.7":      "MiniMax M2.7",
-    "deepseek-v4-flash": "DeepSeek V4 Flash",
+    "deepseek-v4-pro:cloud": "DeepSeek V4 Pro",
 }
 
 

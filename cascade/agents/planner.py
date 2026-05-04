@@ -113,6 +113,17 @@ PLATFORM NOTES — the runner is Linux. Always use `python3` (NOT `python`) and
 the `python` symlink is not guaranteed to exist. Use POSIX shell builtins
 (`test -f`, `wc -l`, `grep -q`, `cat`) for cheap file checks.
 
+QUALITY-CHECK STRENGTH — quality_checks must verify *change*, not mere
+*existence*. A check that goes ✅ when nothing was modified is worse than
+no check. Strong patterns:
+  - `git diff HEAD -- <file> | grep -E "^[+-].*<marker>"` (must be non-empty)
+  - new function/class names: `grep -q "def <new_name>" <file>` paired with
+    a "must NOT exist before" baseline
+  - byte-count change: `[ "$(wc -c < <file>)" -gt 100 ]` after a non-trivial
+    rewrite
+Avoid: counting emojis / matching strings that were already there before
+the change. Reviewer will catch the false-positive but you waste an iter.
+
 TRIVIAL-TASK SHORTCUT — when the task is small enough that the full
 plan-implement-review-iter loop would waste time/tokens, set
 `direct_ops: [...]` instead of `steps`/`files_to_touch`/`acceptance_criteria`.
@@ -226,6 +237,17 @@ PLATTFORM-HINWEISE — der Runner ist Linux. Verwende immer `python3` (NICHT
 quality_checks-Befehl — der `python`-Symlink ist nicht garantiert vorhanden.
 Nutze POSIX-Shell-Builtins (`test -f`, `wc -l`, `grep -q`, `cat`) für günstige
 Datei-Checks.
+
+QUALITY-CHECK-STÄRKE — quality_checks müssen *Veränderung* prüfen, nicht
+bloßes *Vorhandensein*. Ein Check der ✅ liefert obwohl nichts geändert
+wurde ist schlimmer als gar kein Check. Starke Patterns:
+  - `git diff HEAD -- <datei> | grep -E "^[+-].*<marker>"` (muss non-leer)
+  - neue Funktion/Klasse: `grep -q "def <neu>" <datei>` zusammen mit
+    einer "vorher nicht vorhanden"-Baseline
+  - Byte-Größe geändert: `[ "$(wc -c < <datei>)" -gt 100 ]` nach
+    nicht-trivialer Umstrukturierung
+Vermeide: Emoji-Zähler / Strings die schon vor der Änderung im File waren.
+Der Reviewer fängt zwar False-Positives, aber du verbrennst eine Iter.
 
 TRIVIAL-TASK-SHORTCUT — wenn die Aufgabe klein genug ist, dass der volle
 plan-implement-review-iter-Loop Zeit/Tokens verschwenden würde, setze stattdessen

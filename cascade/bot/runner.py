@@ -41,7 +41,69 @@ async def run_task_for_chat(
     msg = update.effective_message
     s = settings()
 
+    # Defense: refuse double-start of the same task. Causes seen in prod:
+    #  - lifecycle.post_init auto-resume races with a queued telegram
+    #    /resume update that survived the restart's Application.stop()
+    #    without being acked, and is re-delivered after Application.start()
+    #  - user double-taps the resume inline keyboard
+    # Both paths land here. Without this check, two run_cascade coroutines
+    # mutate the same workspace and double-post progress events → user
+    # sees the task "twice" in the chat (Apr 27 23:47:45 .003 + .276).
+    if resume_task_id:
+        from .state import TASK_REGISTRY
+        if resume_task_id in TASK_REGISTRY:
+            from logging import getLogger
+            getLogger("cascade.bot.runner").warning(
+                "refused double-start of already-running task %s", resume_task_id,
+            )
+            try:
+                lang = lang_for(update)
+                await msg.reply_text(
+                    f"⏭ Task `{resume_task_id}` läuft bereits — "
+                    f"Doppel-Start verhindert."
+                    if lang == "de" else
+                    f"⏭ Task `{resume_task_id}` already running — "
+                    f"double-start prevented.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+            return
+
     store: Store = ctx.application.bot_data["store"]
+
+    # Auto-Resume guard: refuse resume of tasks that are already in a
+    # terminal state (cancelled/failed/done). Manual user actions (cmd_resume,
+    # cmd_again) reset the status to 'interrupted' before calling here, so
+    # this only blocks accidental auto-resumes from queued/replayed Telegram
+    # updates. Symptom Apr 28 00:00:58: b03f78 was cancelled in DB but a
+    # buffered resume-update from before the restart re-spawned it.
+    if resume_task_id:
+        try:
+            existing = await store.get_task(resume_task_id)
+            if existing and existing.status in ("cancelled", "failed", "done"):
+                from logging import getLogger
+                getLogger("cascade.bot.runner").warning(
+                    "refused resume of terminal task %s (status=%s)",
+                    resume_task_id, existing.status,
+                )
+                try:
+                    lang = lang_for(update)
+                    await msg.reply_text(
+                        f"⏭ Task `{resume_task_id}` ist `{existing.status}` — "
+                        f"Auto-Resume blockiert. Nutze `/again {resume_task_id}` "
+                        f"für expliziten Neu-Start."
+                        if lang == "de" else
+                        f"⏭ Task `{resume_task_id}` is `{existing.status}` — "
+                        f"auto-resume blocked. Use `/again {resume_task_id}` "
+                        f"to explicitly re-run.",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
     sess = await store.get_chat_session(chat.id) if chat else None
     repo = Path(sess["repo_path"]) if sess and sess.get("repo_path") else None
     impl_model = (sess or {}).get("implementer_model")
@@ -690,6 +752,17 @@ async def run_task_for_chat(
             await hb_task
         except (asyncio.CancelledError, Exception):
             pass
+        # Letzte Live-Progress-Card löschen — der Final-Report (oder
+        # cancelled/crashed-Hinweis) wird darunter als einzige End-Karte
+        # gepostet. Konsistent mit dem Heartbeat-Repost-Pattern „card
+        # follows the bottom of the chat" (commit 54bc2a4).
+        last_card = state.get("status_msg")
+        if last_card is not None:
+            try:
+                await last_card.delete()
+            except Exception:
+                pass
+            state["status_msg"] = None
         # Only pop INFLIGHT if it still points at *us* — a newer task in the
         # same chat may have overwritten the slot, and we mustn't clobber it.
         cur = INFLIGHT.get(chat.id)

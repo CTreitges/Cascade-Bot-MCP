@@ -16,6 +16,7 @@ from ..helpers import (
     fmt_local,
     fmt_status_emoji,
     lang_for,
+    md_escape,
     owner_only,
     send,
     send_long,
@@ -220,9 +221,10 @@ async def cmd_history(update: Update, ctx) -> None:
     lines = []
     for task in tasks:
         ts = fmt_local(task.created_at, "%H:%M")
+        preview = (task.task_text or "").replace("\n", " ").replace("\r", " ")[:70]
         lines.append(
             f"{fmt_status_emoji(task.status)} {ts} `{task.id}` "
-            f"i={task.iteration} {task.task_text[:70]}"
+            f"i={task.iteration} {md_escape(preview)}"
         )
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -261,6 +263,14 @@ async def cmd_resume(update: Update, ctx) -> None:
         )
     else:
         task_text = task.task_text
+    # Manueller Resume durch User: Status zurück auf 'interrupted' damit
+    # der Auto-Resume-Guard in run_task_for_chat NICHT greift (der blockt
+    # nur ungewollte Resumes von cancelled/failed/done).
+    if task.status in ("cancelled", "failed", "done"):
+        try:
+            await store.update_task(task.id, status="interrupted")
+        except Exception:
+            pass
     await run_task_for_chat(update, ctx, task_text, resume_task_id=task.id)
 
 
