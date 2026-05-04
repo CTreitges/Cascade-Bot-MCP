@@ -29,6 +29,7 @@ from .handlers.config import (
     cmd_models,
     cmd_replan,
     cmd_repo,
+    cmd_role,
     cmd_subtasks,
     cmd_toggles,
     on_effort_callback,
@@ -142,6 +143,7 @@ def main() -> None:
     app.add_handler(CommandHandler("failsbeforereplan", cmd_failsbeforereplan))
     app.add_handler(CommandHandler("subtasks", cmd_subtasks))
     app.add_handler(CommandHandler("toggles", cmd_toggles))
+    app.add_handler(CommandHandler("role", cmd_role))
 
     # Skills
     app.add_handler(CommandHandler("skills", cmd_skills))
@@ -180,7 +182,15 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
 
     log.info("Cascade bot starting; owner=%s", s.telegram_owner_id)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # drop_pending_updates=True verwirft Telegram-Updates die während des
+    # Stop/Restart-Fensters aufgelaufen sind. Ohne das: wenn Bot eine
+    # /restart durchläuft und der User vorher /resume getippt hat (oder
+    # ein resume-Inline-Callback noch nicht ge-acked war), wird der
+    # alte Update beim Polling-Resume re-delivered und startet einen
+    # cancelled task wieder. Symptom Apr 28 00:00:58: b03f78 wurde
+    # 5s nach Application-Start automatisch resumed obwohl in DB als
+    # cancelled markiert.
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":

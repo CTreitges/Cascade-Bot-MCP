@@ -247,6 +247,8 @@ _MIGRATIONS = [
     "ALTER TABLE sessions ADD COLUMN auto_decompose INTEGER",
     "ALTER TABLE sessions ADD COLUMN max_subtasks INTEGER",
     "ALTER TABLE sessions ADD COLUMN multiplan_enabled INTEGER",
+    # Plan v4 Phase C — per-Rolle Harness/Provider/Subagent-Overrides als JSON
+    "ALTER TABLE sessions ADD COLUMN role_overrides_json TEXT",
     # Chat-Memory v2 — file content + classification on chat_messages
     "ALTER TABLE chat_messages ADD COLUMN file_path TEXT",
     "ALTER TABLE chat_messages ADD COLUMN file_content TEXT",
@@ -1165,5 +1167,23 @@ class Store:
             "lang": row["lang"],
             "auto_decompose": row["auto_decompose"],
             "max_subtasks": row["max_subtasks"],
+            "role_overrides_json": (
+                row["role_overrides_json"] if "role_overrides_json" in row.keys() else None
+            ),
             "updated_at": row["updated_at"],
         }
+
+    async def set_role_overrides_json(
+        self, chat_id: int, overrides_json: str | None,
+    ) -> None:
+        """Setzt role_overrides_json (Plan v4 Phase C). Übergib leeren String oder
+        None um Overrides für diesen Chat zu löschen."""
+        async with self._tx() as c:
+            await c.execute(
+                """INSERT INTO sessions (chat_id, role_overrides_json, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(chat_id) DO UPDATE SET
+                     role_overrides_json = excluded.role_overrides_json,
+                     updated_at = excluded.updated_at""",
+                (chat_id, overrides_json or None, time.time()),
+            )

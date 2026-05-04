@@ -1,7 +1,8 @@
-"""Config commands: /repo /lang /models /effort /replan + their callbacks."""
+"""Config commands: /repo /lang /models /effort /replan /role + their callbacks."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -16,10 +17,21 @@ from cascade.models import (
     effort_levels_for,
     model_supports_effort,
 )
+from cascade.role_config import (
+    detect_provider,
+    encode_role_overrides,
+    get_role_config,
+    parse_role_overrides,
+)
 from cascade.store import Store
 
 from ..helpers import lang_for, owner_only
 from ..state import ITERATION_CHOICES, LANG_OVERRIDE, REPLAN_CHOICES, UNLIMITED_SENTINEL
+
+
+_ROLE_NAMES = ("planner", "implementer", "reviewer", "subagent")
+_HARNESS_NAMES = ("claude-code", "codex")
+_PROVIDER_NAMES = ("anthropic", "openai", "ollama")
 
 
 # ---------- /repo ----------
@@ -864,3 +876,181 @@ async def on_iterations_callback(update: Update, ctx) -> None:
             shown = _fmt_budget_value(n)
             txt = f"✅ Max-Iterationen = `{shown}`" if lang == "de" else f"✅ Max iterations = `{shown}`"
         await q.edit_message_text(txt, parse_mode=ParseMode.MARKDOWN)
+
+
+# ---------- /role (Plan v4 Phase C) ----------
+
+def _parse_role_kvs(args: list[str]) -> dict[str, str]:
+    """Parse `key=value` pairs aus Telegram-Argumenten."""
+    out: dict[str, str] = {}
+    for a in args:
+        if "=" in a:
+            k, v = a.split("=", 1)
+            out[k.strip().lower()] = v.strip()
+    return out
+
+
+def _format_role_block(role: str, sess: dict | None, lang: str) -> str:
+    rc = get_role_config(role, settings, sess)
+    sub = "✅" if rc.enable_subagents else "⬜"
+    line_de = (
+        f"*{role}*: `{rc.model}`  ({rc.provider}/{rc.harness})"
+        f"  effort={rc.effort or '—'}  sub-agents={sub}"
+    )
+    line_en = (
+        f"*{role}*: `{rc.model}`  ({rc.provider}/{rc.harness})"
+        f"  effort={rc.effort or '—'}  sub-agents={sub}"
+    )
+    return line_de if lang == "de" else line_en
+
+
+async def cmd_role(update: Update, ctx) -> None:
+    """`/role` — zeigt + setzt per-Rolle Harness/Provider/Model/Sub-Agents.
+
+    Aufrufe:
+        /role
+            zeigt aktuelle Resolution für alle Rollen.
+        /role <role> harness=claude-code provider=ollama model=kimi-k2.6
+            setzt Overrides für die genannte Rolle. Mehrere Keys möglich.
+            Erlaubte Keys: harness, provider, model, effort, subagents (on|off|true|false).
+        /role <role> reset
+            entfernt alle Overrides für diese Rolle.
+        /role reset
+            entfernt alle Overrides für alle Rollen.
+    """
+    if not await owner_only(update, ctx):
+        return
+    lang = lang_for(update)
+    store: Store = ctx.application.bot_data["store"]
+    chat_id = update.effective_chat.id
+    args = ctx.args or []
+    sess = await store.get_chat_session(chat_id)
+
+    # --- Anzeige ohne Args -----------------------------------------------
+    if not args:
+        lines = [
+            "🎭 *Rollen-Konfiguration für diesen Chat*"
+            if lang == "de"
+            else "🎭 *Role configuration for this chat*",
+            "",
+        ]
+        for r in _ROLE_NAMES:
+            lines.append(_format_role_block(r, sess, lang))
+        lines.append("")
+        lines.append(
+            "_Setzen:_ `/role <role> harness=… provider=… model=… subagents=on|off`"
+            if lang == "de"
+            else "_Set:_ `/role <role> harness=… provider=… model=… subagents=on|off`"
+        )
+        lines.append(
+            "_Reset:_ `/role <role> reset` oder `/role reset`"
+            if lang == "de"
+            else "_Reset:_ `/role <role> reset` or `/role reset`"
+        )
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # --- Global-Reset ----------------------------------------------------
+    if len(args) == 1 and args[0].lower() == "reset":
+        await store.set_role_overrides_json(chat_id, None)
+        msg = "✅ Alle Rollen-Overrides zurückgesetzt." if lang == "de" else "✅ All role overrides cleared."
+        await update.message.reply_text(msg)
+        return
+
+    # --- Pro-Rolle setzen ------------------------------------------------
+    role = args[0].lower()
+    if role not in _ROLE_NAMES:
+        msg = (
+            f"❌ Unbekannte Rolle `{role}`. Erlaubt: {', '.join(_ROLE_NAMES)}"
+            if lang == "de"
+            else f"❌ Unknown role `{role}`. Valid: {', '.join(_ROLE_NAMES)}"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Bestehende Overrides laden, mutieren, zurückschreiben
+    current = parse_role_overrides(sess.get("role_overrides_json") if sess else None)
+
+    # Reset für eine Rolle
+    if len(args) >= 2 and args[1].lower() == "reset":
+        current.pop(role, None)
+        encoded = encode_role_overrides(current)
+        await store.set_role_overrides_json(chat_id, encoded or None)
+        msg = f"✅ Overrides für `{role}` zurückgesetzt." if lang == "de" else f"✅ Overrides for `{role}` cleared."
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Set-Modus
+    kvs = _parse_role_kvs(args[1:])
+    if not kvs:
+        msg = (
+            f"⚠️ Keine `key=value` Argumente. Beispiel: `/role {role} model=claude-opus-4-7`"
+            if lang == "de"
+            else f"⚠️ No `key=value` arguments. Example: `/role {role} model=claude-opus-4-7`"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    role_ovr = dict(current.get(role, {}))
+    errors: list[str] = []
+
+    if "harness" in kvs:
+        v = kvs["harness"]
+        if v not in _HARNESS_NAMES:
+            errors.append(f"harness muss eines von {_HARNESS_NAMES} sein, war `{v}`")
+        else:
+            role_ovr["harness"] = v
+    if "provider" in kvs:
+        v = kvs["provider"]
+        if v not in _PROVIDER_NAMES:
+            errors.append(f"provider muss eines von {_PROVIDER_NAMES} sein, war `{v}`")
+        else:
+            role_ovr["provider"] = v
+    if "model" in kvs:
+        role_ovr["model"] = kvs["model"]
+        # Provider auto-detect wenn nicht explizit gesetzt
+        if "provider" not in kvs:
+            role_ovr["provider"] = detect_provider(kvs["model"])
+    if "effort" in kvs:
+        v = kvs["effort"].lower()
+        role_ovr["effort"] = v if v else None
+    if "subagents" in kvs or "sub_agents" in kvs:
+        raw = kvs.get("subagents") or kvs.get("sub_agents")
+        role_ovr["enable_subagents"] = raw.lower() in ("on", "true", "1", "yes", "ja")
+    if "max_turns" in kvs:
+        try:
+            role_ovr["max_turns"] = int(kvs["max_turns"])
+        except ValueError:
+            errors.append(f"max_turns muss eine Ganzzahl sein, war `{kvs['max_turns']}`")
+
+    if errors:
+        msg = "❌ " + ("Fehler:" if lang == "de" else "Errors:") + "\n" + "\n".join(f"• {e}" for e in errors)
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Codex-Vorabwarnung
+    if role_ovr.get("harness") == "codex":
+        await update.message.reply_text(
+            "⚠️ `harness=codex` ist noch nicht implementiert (Stub). "
+            "Setze stattdessen `harness=claude-code` und `provider=openai` für GPT-Modelle.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    current[role] = role_ovr
+    encoded = encode_role_overrides(current)
+    await store.set_role_overrides_json(chat_id, encoded or None)
+
+    # Re-Resolve + Anzeigen was jetzt gilt
+    sess_new = await store.get_chat_session(chat_id)
+    rc = get_role_config(role, settings, sess_new)
+    msg = (
+        f"✅ Aktualisiert *{role}*: `{rc.model}` ({rc.provider}/{rc.harness}, "
+        f"effort={rc.effort or '—'}, subagents={'on' if rc.enable_subagents else 'off'})"
+        if lang == "de"
+        else f"✅ Updated *{role}*: `{rc.model}` ({rc.provider}/{rc.harness}, "
+        f"effort={rc.effort or '—'}, subagents={'on' if rc.enable_subagents else 'off'})"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
