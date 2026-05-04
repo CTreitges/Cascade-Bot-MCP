@@ -465,6 +465,62 @@ async def run_cascade(
                         progress,
                     )
 
+            # Plan v4 Phase D — DAG-Validation für Sub-Tasks.
+            # Prüft Sub-Task-Name-Eindeutigkeit, depends_on-Refs, Zyklus-
+            # Freiheit. Bei Fehlern: einen Replan triggern mit konkreter
+            # Fehlerliste; danach hard-fail wenn immer noch kaputt.
+            if plan.subtasks:
+                from cascade.dag import validate_dag as _validate_dag
+                dag_errors = _validate_dag(plan.subtasks)
+                if dag_errors:
+                    await _log(
+                        store, task_id, "warn",
+                        "plan validation: DAG-Fehler — "
+                        + " | ".join(dag_errors[:5]),
+                    )
+                    try:
+                        plan = await call_planner(
+                            task,
+                            attachments=attachments,
+                            recall_context=recall,
+                            repo_candidates_block=repo_candidates_block,
+                            replan_feedback=(
+                                "Your previous plan had DAG inconsistencies "
+                                "in `subtasks[].depends_on` or `name`:\n"
+                                + "\n".join(f"- {e}" for e in dag_errors[:8])
+                                + "\nFix: each sub-task must have a unique "
+                                "name; depends_on may only reference names "
+                                "of OTHER sub-tasks in the same plan; no "
+                                "cycles."
+                            ),
+                            external_context=external_context,
+                            temperature=planner_temperature,
+                            lang=lang,
+                            s=s,
+                        )
+                        plan = augment_quality_checks_for_python(plan)
+                    except Exception as e:
+                        placeholder_root.mkdir(parents=True, exist_ok=True)
+                        ws_err = Workspace(placeholder_root)
+                        return await _fail(
+                            store, task_id, ws_err,
+                            "planner-retry on DAG errors", e, progress,
+                        )
+                    if plan.subtasks:
+                        dag_errors2 = _validate_dag(plan.subtasks)
+                        if dag_errors2:
+                            placeholder_root.mkdir(parents=True, exist_ok=True)
+                            ws_err = Workspace(placeholder_root)
+                            return await _fail(
+                                store, task_id, ws_err, "plan validation",
+                                RuntimeError(
+                                    "planner returned an inconsistent DAG "
+                                    "twice — refusing to run. errors: "
+                                    + "; ".join(dag_errors2[:5])
+                                ),
+                                progress,
+                            )
+
         # Resolve workspace. On resume: pin to the existing workspace_path
         # so we don't accidentally jump into a different one and lose state.
         if resumed_workspace_path is not None and resumed_workspace_path.exists():

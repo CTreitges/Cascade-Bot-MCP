@@ -37,6 +37,23 @@ class SubTask(BaseModel):
         default_factory=list,
         description="Names of sub-tasks that must finish before this one starts.",
     )
+    # Plan v4 Phase D — Sub-Agent-Modus pro Sub-Task.
+    # "off"                    Sub-Task läuft als ein einzelner Implementer-Run, keine
+    #                          nested sub-agents (Default).
+    # "dag"                    Sub-Task ist Teil eines DAG; Cascade-Orchestrator
+    #                          parallelisiert ihn ggf. mit anderen "dag"-Sub-Tasks
+    #                          (Phase E — derzeit reserviertes Feld).
+    # "implementer-dispatched" Implementer darf das `Task`-Tool nutzen, um selbst
+    #                          weitere sub-agents zu spawnen (claude-agent-sdk Feature).
+    sub_agents_mode: Literal["off", "dag", "implementer-dispatched"] = Field(
+        default="off",
+        description=(
+            "Sub-Agent-Strategie: 'off' = serieller Run, 'dag' = im "
+            "Orchestrator-DAG parallelisierbar (Phase E), "
+            "'implementer-dispatched' = Implementer hat Task-Tool zum "
+            "selbstständigen Spawnen von Sub-Agents."
+        ),
+    )
 
 
 class Plan(BaseModel):
