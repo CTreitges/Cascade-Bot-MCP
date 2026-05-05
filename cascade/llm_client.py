@@ -67,8 +67,16 @@ async def implementer_chat(
     timeout_s: float = 1800,
 ) -> LLMReply:
     s = s or settings()
-    provider = provider or s.cascade_implementer_provider
     model = model or s.cascade_implementer_model
+    # Provider-Auto-Detection wenn nicht explizit angegeben:
+    # claude-* Modelle → claude CLI, sonst settings-Default (typisch ollama).
+    # Verhindert dass run_cascade_tool(implementer_model="claude-sonnet-4-6")
+    # in den ollama-Pfad fällt und mit 401 unauthorized scheitert.
+    if provider is None:
+        if model.startswith("claude-"):
+            provider = "claude"
+        else:
+            provider = s.cascade_implementer_provider
     messages = _build_messages(system=system, user=user, json_schema_hint=json_schema_hint)
     from .rate_limit import with_retry
 
