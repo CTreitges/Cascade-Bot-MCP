@@ -176,6 +176,15 @@ async def run_cascade(
     # one comparable row per run for next-session forensics.
     run_started_at = time.monotonic()
 
+    # Plan v5 R5 — Trace-Context für korrelierte Events.
+    try:
+        from .observability import emit as _obs_emit, set_trace_context, new_trace_id
+        _obs_trace_id = new_trace_id()
+        set_trace_context(trace_id=_obs_trace_id, task_id=task_id)
+        _obs_emit("run_start", {"task_text": task[:200]})
+    except Exception:
+        _obs_emit = None
+
     # Carry resume state out of the conditional so later code can check
     # whether to restore a saved plan / pin a workspace / skip done sub-tasks.
     resumed_plan: Plan | None = None
@@ -385,12 +394,19 @@ async def run_cascade(
                         f"multiplan picked: {pick_reason}",
                     )
                 else:
+                    # Plan v5 R6 — Pattern-Lookup für ähnliche frühere Tasks.
+                    # Best-effort: bei Fehlern wird der Plan ohne prior_patterns
+                    # erstellt (alter Pfad).
+                    prior_patterns_block = await _try_build_prior_patterns(
+                        task=task, lang=lang
+                    )
                     plan = await call_planner(
                         task,
                         attachments=attachments,
                         recall_context=recall,
                         repo_candidates_block=repo_candidates_block,
                         external_context=external_context,
+                        prior_patterns=prior_patterns_block,
                         temperature=planner_temperature,
                         lang=lang,
                         s=s,
@@ -2552,6 +2568,26 @@ async def _finalize_done_run(
         await _log(store, task_id, "warn", f"skill suggest failed: {e}")
 
 
+async def _try_build_prior_patterns(*, task: str, lang: str = "de") -> str | None:
+    """Plan v5 R6 — sucht ähnliche erfolgreiche Patterns für diesen Task,
+    rendert PRIOR_SUCCESSFUL_PATTERNS-Block für den Planner. Best-effort:
+    bei jedem Fehler return None (Planner läuft dann ohne den Block)."""
+    try:
+        from .config import settings as _s
+        from .patterns import PatternStore, find_similar, render_for_planner
+        s = _s()
+        store = PatternStore(s.cascade_home / "store" / "patterns.jsonl")
+        similar = find_similar(
+            store=store, task_text=task, top_n=3, min_similarity=0.15,
+        )
+        if not similar:
+            return None
+        return render_for_planner(similar, lang=lang)
+    except Exception as e:
+        log.debug("prior_patterns lookup failed: %s", e)
+        return None
+
+
 async def _try_reflect(
     *,
     task: str,
@@ -2562,6 +2598,11 @@ async def _try_reflect(
     store: Store,
     s: Settings,
     lang: str = "de",
+    success: bool = True,
+    cost_usd: float = 0.0,
+    wall_clock_s: float = 0.0,
+    replans_needed: int = 0,
+    files_changed: list | None = None,
 ) -> None:
     """Best-effort post-run self-reflection. Used by both done- and
     failed-paths so we capture lessons-learned regardless of outcome.
@@ -2590,6 +2631,30 @@ async def _try_reflect(
             )
     except Exception as e:
         log.debug("reflect_on_run failed: %s", e)
+
+    # Plan v5 R6 — bei status='done' und non-trivial run (iter > 1 oder
+    # replans > 0) das Pattern speichern damit ähnliche Tasks später
+    # davon profitieren.
+    if success and (iterations > 1 or replans_needed > 0):
+        try:
+            from .reflect import record_success_pattern
+            sub_task_names = [st.name for st in (plan.subtasks or [])]
+            await record_success_pattern(
+                task_text=task,
+                plan_summary=plan.summary or "",
+                sub_task_names=sub_task_names,
+                files_changed=files_changed or list(plan.files_to_touch or []),
+                iterations=iterations,
+                cost_usd=cost_usd,
+                wall_clock_s=wall_clock_s,
+                replans_needed=replans_needed,
+            )
+            await _log(
+                store, task_id, "info",
+                f"pattern recorded for cross-task recall (iter={iterations}, replans={replans_needed})",
+            )
+        except Exception as e:
+            log.debug("record_success_pattern failed: %s", e)
 
 
 async def _planner_or_multiplan(

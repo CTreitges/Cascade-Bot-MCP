@@ -377,6 +377,7 @@ def _build_prompt(
     repo_candidates_block: str | None,
     replan_feedback: str | None = None,
     external_context: str | None = None,
+    prior_patterns: str | None = None,
 ) -> str:
     parts = [f"TASK:\n{task}"]
     if external_context:
@@ -385,6 +386,9 @@ def _build_prompt(
         parts.append(f"\n{repo_candidates_block}")
     if recall_context:
         parts.append(f"\nRELEVANT MEMORIES:\n{recall_context}")
+    if prior_patterns:
+        # Plan v5 R6 — erfolgreiche frühere Patterns als Inspiration
+        parts.append(f"\n{prior_patterns}")
     if replan_feedback:
         parts.append(
             "\nRE-PLAN — the previous plan failed in the implement-review loop. "
@@ -408,6 +412,7 @@ async def call_planner(
     repo_candidates_block: str | None = None,
     replan_feedback: str | None = None,
     external_context: str | None = None,
+    prior_patterns: str | None = None,
     temperature: float | None = None,
     lang: str = "en",
     s: Settings | None = None,
@@ -415,7 +420,8 @@ async def call_planner(
     s = s or settings()
     system = PLANNER_SYSTEM_DE if lang == "de" else PLANNER_SYSTEM_EN
     user_prompt = _build_prompt(
-        task, recall_context, repo_candidates_block, replan_feedback, external_context,
+        task, recall_context, repo_candidates_block, replan_feedback,
+        external_context, prior_patterns=prior_patterns,
     )
     raw = await agent_chat(
         prompt=user_prompt,
