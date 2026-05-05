@@ -185,6 +185,19 @@ async def run_cascade(
     except Exception:
         _obs_emit = None
 
+    # Plan v5 R3 — Per-Run Budget-State + Limits aus Settings.
+    try:
+        from .cost_budget import BudgetState, BudgetLimits
+        _budget_state = BudgetState(run_id=task_id)
+        _budget_limits = BudgetLimits(
+            per_run_max_usd=float(getattr(s, "cascade_per_run_max_usd", 5.0)),
+            per_day_max_usd=float(getattr(s, "cascade_per_day_max_usd", 50.0)),
+            per_month_max_usd=float(getattr(s, "cascade_per_month_max_usd", 1000.0)),
+        )
+    except Exception:
+        _budget_state = None
+        _budget_limits = None
+
     # Carry resume state out of the conditional so later code can check
     # whether to restore a saved plan / pin a workspace / skip done sub-tasks.
     resumed_plan: Plan | None = None
@@ -245,11 +258,34 @@ async def run_cascade(
             if existing.workspace_path:
                 resumed_workspace_path = Path(existing.workspace_path)
         else:
+            # Plan v5 R2 — Tier-Routing: vor Task-Create Modell-Override
+            # via complexity-Heuristik. Nur wenn cascade_use_tier_routing=True
+            # UND kein expliziter implementer_model-Override durch Caller.
+            _resolved_model = implementer_model or s.cascade_implementer_model
+            if (
+                getattr(s, "cascade_use_tier_routing", False)
+                and not implementer_model
+            ):
+                try:
+                    from .complexity import decide_tier, model_for_tier
+                    _tier_decision = await decide_tier(task, plan=None, settings=None)
+                    _tier_model = model_for_tier(_tier_decision.tier)
+                    if _tier_model and _tier_model != _resolved_model:
+                        _resolved_model = _tier_model
+                        log.info(
+                            "tier-routing: tier=%s (conf=%.2f, %s) → model=%s",
+                            _tier_decision.tier.value,
+                            _tier_decision.confidence,
+                            _tier_decision.reason,
+                            _resolved_model,
+                        )
+                except Exception as e:
+                    log.debug("tier-routing failed: %s", e)
             task_id = await store.create_task(
                 source=source,
                 task_text=task,
                 repo_path=str(repo) if repo else None,
-                implementer_model=implementer_model or s.cascade_implementer_model,
+                implementer_model=_resolved_model,
                 implementer_tools=implementer_tools or s.cascade_implementer_tools,
                 metadata={"start_settings": _snapshot_settings(s)},
             )

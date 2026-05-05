@@ -138,6 +138,16 @@ class Settings(BaseSettings):
     cascade_skill_suggest_cooldown_s: int = 300
     cascade_workspace_retention_days: int = 7
 
+    # ── Plan v5 R3 — Cost-Budget pro Run / Tag / Monat ────────────────
+    # Default-Caps konservativ. Flippen via /budget-Command (späterer
+    # Phase-J+ Schritt).
+    cascade_per_run_max_usd: float = 5.0
+    cascade_per_day_max_usd: float = 50.0
+    cascade_per_month_max_usd: float = 1000.0
+    # Plan v5 R2 — Tier-Routing aktiv? Wenn True: complexity.decide_tier
+    # vor Implementer-Call und passendes Modell wählen.
+    cascade_use_tier_routing: bool = False
+
     # ── Robustheit: Replan-Hard-Cap (Stufe 3.2) ───────────────────────
     # Hard-Timeout um Replan-LLM-Calls in Sekunden. Default 600 (10min) —
     # fängt echte Hänger ohne legitime LLM-Latency zu killen. Wenn der

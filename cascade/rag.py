@@ -143,7 +143,15 @@ class RagStore:
     def _embed(self, texts: List[str]) -> List[List[float]]:
         if not self._ensure_client():
             return []
-        return self._embedder.encode(texts, convert_to_numpy=False).tolist()
+        # sentence-transformers v5: convert_to_numpy=True liefert numpy-Array
+        # mit .tolist() — älteres API hatte Tensor mit .tolist(). Defensiv:
+        # akzeptiere beide Rückgaben.
+        result = self._embedder.encode(texts, convert_to_numpy=True)
+        try:
+            return result.tolist()
+        except AttributeError:
+            # Fallback: schon Liste (sehr alte/sehr neue Variante)
+            return [list(v) for v in result]
 
     # ── Index-Operations ──────────────────────────────────────────────
     def upsert(self, docs: List[RagDoc]) -> int:
@@ -161,11 +169,18 @@ class RagStore:
             if coll is None:
                 continue
             embeddings = self._embed([d.text for d in group])
+            # chromadb v1.5+ verlangt non-empty metadata pro Doc.
+            # Mindestens "source" mitgeben.
+            metadatas = []
+            for d in group:
+                meta = dict(d.metadata) if d.metadata else {}
+                meta.setdefault("source", d.source or "unknown")
+                metadatas.append(meta)
             coll.upsert(
                 ids=[d.id for d in group],
                 embeddings=embeddings,
                 documents=[d.text for d in group],
-                metadatas=[d.metadata for d in group],
+                metadatas=metadatas,
             )
             total += len(group)
         return total
