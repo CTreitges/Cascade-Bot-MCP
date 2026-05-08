@@ -13,6 +13,7 @@ store/debug.log*
 store/telegram.log*
 store/errors.log*
 store/cascade_session.json
+store/rag/
 
 # Per-task workspaces — always machine-local
 workspaces/

@@ -38,6 +38,27 @@ async def post_init(application: Application) -> None:
     except Exception as e:
         log.warning("patterns: init failed: %s", e)
 
+    # Plan v5 R4 — RAG-Hybrid: Eager-Init im Hintergrund (asyncio.to_thread)
+    # damit der erste recall_context nicht 30s blockiert während
+    # sentence-transformers das Modell vom HF-Hub zieht. Wenn deps fehlen:
+    # fällt auf BM25-only zurück. Der Init läuft NICHT im Bot-Boot-Pfad
+    # selber damit ein langsamer Disk/Cache-Pfad nicht den Bot-Start blockt.
+    try:
+        import asyncio
+        from cascade.memory import _get_rag_store
+        async def _warm_rag():
+            try:
+                ok = await asyncio.to_thread(_get_rag_store)
+                if ok is not None:
+                    log.info("rag: store warm-loaded (chromadb + ST verfügbar)")
+                else:
+                    log.info("rag: deps fehlen oder Init failed → BM25-only recall")
+            except Exception as e:
+                log.debug("rag: warm-init failed: %s", e)
+        application.bot_data["rag_warmup_task"] = asyncio.create_task(_warm_rag())
+    except Exception as e:
+        log.warning("rag: warm-init schedule failed: %s", e)
+
     # Owner-Notification: bot frisch gestartet. Hilft beim manuellen
     # Restart-Workflow zu sehen wann der Bot wieder ansprechbar ist
     # (vorher musste man "Bot is typing" oder /status pingen).

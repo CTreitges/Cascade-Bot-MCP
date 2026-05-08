@@ -96,6 +96,14 @@ async def remember_finding(
     if await asyncio.to_thread(_append_jsonl, entry):
         ok = True
 
+    # 3) Plan v5 R4 — RAG-Index (best-effort, no-op wenn deps fehlen).
+    #    Embeds new insights damit semantic-recall sie findet auch wenn keine
+    #    BM25-Term-Overlap besteht.
+    try:
+        await asyncio.to_thread(_rag_upsert_entry, entry)
+    except Exception as e:
+        log.debug("rag upsert failed: %s", e)
+
     if ok:
         log.info("memory[%s/%s] %s", category, importance, content[:120])
     return ok
@@ -224,10 +232,86 @@ def _bm25_score(
     return score
 
 
+# Plan v5 R4 — Lazy-Singleton für RagStore. Persist-dir wird beim ersten
+# Zugriff erstellt. Wenn chromadb / sentence-transformers fehlen oder der
+# Store-Init scheitert: dauerhaft None → recall_context fällt sauber auf
+# BM25-only zurück.
+_RAG_STORE: Any = None
+_RAG_INIT_TRIED: bool = False
+
+
+def _get_rag_store() -> Any:
+    """Lazy lookup. Returns RagStore wenn deps + persist-dir ok, sonst None."""
+    global _RAG_STORE, _RAG_INIT_TRIED
+    if _RAG_STORE is not None:
+        return _RAG_STORE
+    if _RAG_INIT_TRIED:
+        return None
+    _RAG_INIT_TRIED = True
+    try:
+        from .rag import RagStore, is_available
+        if not is_available():
+            return None
+        s = settings()
+        _RAG_STORE = RagStore(persist_dir=s.cascade_home / "store" / "rag")
+        # warm-up: ensure client is loaded so ersten search nicht blockiert
+        try:
+            _RAG_STORE._ensure_client()
+        except Exception:
+            pass
+        return _RAG_STORE
+    except Exception as e:
+        log.debug("rag store lazy-init failed: %s", e)
+        _RAG_STORE = None
+        return None
+
+
+def _rlm_entry_id(entry: dict) -> str:
+    """Stabile ID für ein RLM-Entry: hash über (ts, content[:200])."""
+    import hashlib
+    h = hashlib.sha1(
+        f"{entry.get('ts', 0):.0f}|{(entry.get('content') or '')[:200]}".encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()[:16]
+    return f"rlm:{h}"
+
+
+def _rag_upsert_entry(entry: dict) -> None:
+    """Synchronous helper (run via to_thread). Embedded ein RLM-Entry in den
+    RAG-Index. Skipt sauber wenn deps fehlen oder Store nicht init."""
+    store = _get_rag_store()
+    if store is None:
+        return
+    try:
+        from .rag import RagDoc
+        text = (entry.get("content") or "").strip()
+        if not text:
+            return
+        doc = RagDoc(
+            id=_rlm_entry_id(entry),
+            text=text,
+            source="rlm",
+            metadata={
+                "category": str(entry.get("category", "")),
+                "importance": str(entry.get("importance", "")),
+                "tags": str(entry.get("tags", "")),
+            },
+        )
+        store.upsert([doc])
+    except Exception as e:
+        log.debug("rag upsert (entry) failed: %s", e)
+
+
 async def recall_context(task: str, *, limit: int = 3) -> str | None:
     """BM25-ranked recall over the local memory.jsonl. Searches across both
     `content` and `file_content`-like fields plus tags. Importance metadata
     nudges the ranking (`high`/`critical` rank slightly higher).
+
+    Plan v5 R4: zusätzlich semantic-recall via RAG (chromadb+sentence-
+    transformers) wenn deps installiert. RLM (BM25, primary, weight=1.5)
+    und RAG (vector, secondary, weight=1.0) werden via reciprocal-rank-
+    fusion kombiniert. Wenn RAG-Layer no-op ist, fällt der Pfad sauber
+    auf reines BM25 zurück.
 
     Returns a bullet-list of the top `limit` matches, or None if nothing
     scores above zero.
@@ -287,12 +371,59 @@ async def recall_context(task: str, *, limit: int = 3) -> str | None:
         return scored[:limit]
 
     ranked = await asyncio.to_thread(_scan_and_rank)
-    if not ranked:
+
+    # Plan v5 R4 — RAG-Augmentation. Liefert leere Liste wenn deps fehlen
+    # oder Index leer. Best-effort, jeder Fehler → bm25-only fallback.
+    # Min-Similarity-Threshold (0.30) damit cosine-similarity nicht
+    # konstant-low irrelevante Hits durchlässt — RAG soll nur ergänzen
+    # wenn semantisch wirklich nahe, nicht "irgendwas" zurückwerfen.
+    def _rag_search() -> list:
+        store = _get_rag_store()
+        if store is None:
+            return []
+        try:
+            hits = store.search(task, n=max(limit, 5))
+            return [h for h in hits if h.score >= 0.30]
+        except Exception as e:
+            log.debug("rag search failed: %s", e)
+            return []
+
+    rag_hits = await asyncio.to_thread(_rag_search)
+
+    if not ranked and not rag_hits:
         return None
+
+    rlm_dicts: list[dict] = []
+    for score, e in ranked or []:
+        rlm_dicts.append({
+            "id": _rlm_entry_id(e),
+            "content": (e.get("content") or "")[:240],
+            "category": e.get("category", "?"),
+            "importance": e.get("importance", "?"),
+            "bm25_score": score,
+        })
+
+    if rag_hits:
+        try:
+            from .rag import reciprocal_rank_fusion
+            fused = reciprocal_rank_fusion(rlm_dicts, rag_hits)[:limit]
+        except Exception as e:
+            log.debug("rrf failed, falling back to bm25-only: %s", e)
+            fused = rlm_dicts[:limit]
+    else:
+        fused = rlm_dicts[:limit]
+
+    if not fused:
+        return None
+
     lines = []
-    for score, e in ranked:
-        cat = e.get("category", "?")
-        imp = e.get("importance", "?")
-        content = (e.get("content") or "")[:240]
-        lines.append(f"  [{cat}/{imp} score={score:.2f}] {content}")
+    for h in fused:
+        meta = h.get("metadata") or {}
+        cat = meta.get("category") or h.get("category", "?")
+        imp = meta.get("importance") or h.get("importance", "?")
+        src = h.get("source", "rlm")
+        score = h.get("rrf_score") or h.get("bm25_score") or h.get("score", 0.0)
+        content = (h.get("content") or "")[:240]
+        src_marker = f" via {src}" if src and src != "rlm" else ""
+        lines.append(f"  [{cat}/{imp} score={score:.3f}{src_marker}] {content}")
     return "\n".join(lines)
