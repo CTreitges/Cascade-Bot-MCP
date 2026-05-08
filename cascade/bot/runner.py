@@ -327,6 +327,24 @@ async def run_task_for_chat(
             state["skill_suggestion"] = {"task_id": task_id, **payload}
             return
 
+        # Plan v5 R5 — Run-Summary-Card am Ende jedes Runs (kostet+Tools).
+        if event == "run_card":
+            text = (payload or {}).get("text") or ""
+            if text:
+                try:
+                    from telegram.constants import ParseMode as _PM
+                    head = "📊 *Run-Summary*" if lang == "de" else "📊 *Run summary*"
+                    await msg.reply_text(
+                        f"{head}\n```\n{text}\n```",
+                        parse_mode=_PM.MARKDOWN,
+                    )
+                except Exception:
+                    try:
+                        await msg.reply_text(text)
+                    except Exception:
+                        pass
+            return
+
         # Standalone milestone messages — much more visible than rolling edits.
         try:
             if event == "planned":

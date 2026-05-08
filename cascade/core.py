@@ -48,6 +48,7 @@ ProgressEvent = Literal[
     "log",
     "waiting_for_session",
     "hard_stuck",
+    "run_card",
 ]
 
 ProgressCallback = Callable[[str, ProgressEvent, dict], Awaitable[None]]
@@ -175,6 +176,7 @@ async def run_cascade(
     # terminal path. Lets `journalctl … | grep RUN_SUMMARY | jq` show
     # one comparable row per run for next-session forensics.
     run_started_at = time.monotonic()
+    run_started_at_wall = time.time()  # for R5 RunSummary final-card
 
     # Plan v5 R5 — Trace-Context für korrelierte Events.
     try:
@@ -2298,6 +2300,41 @@ async def run_cascade(
         )
 
     finally:
+        # Plan v5 R5 — Final Run-Card via progress (Telegram-UI-Hook).
+        # Build aus _budget_state (R3) + run_started_at; nur wenn LLM-Calls
+        # tatsächlich passierten (spent>0) ODER warnings emitted wurden.
+        # Best-effort: jeder Fehler hier wird verschluckt damit das normale
+        # finally-Cleanup garantiert läuft.
+        try:
+            _bs = locals().get("_budget_state")
+            if _bs is not None and (
+                getattr(_bs, "spent_usd", 0.0) > 0.0
+                or bool(getattr(_bs, "warnings_emitted", []))
+            ):
+                from .observability import RunSummary as _RunSummary
+                _rs = _RunSummary(
+                    trace_id=locals().get("_obs_trace_id") or "",
+                    task_id=task_id,
+                    started_at=locals().get("run_started_at_wall") or time.time(),
+                )
+                _rs.total_cost_usd = float(_bs.spent_usd)
+                _rs.by_role_cost = dict(_bs.by_role)
+                _rs.by_model_cost = dict(_bs.by_model)
+                # Status: Done wenn task im store status=done, sonst false.
+                _final_status = "failed"
+                try:
+                    _final_task = await store.get_task(task_id)
+                    if _final_task and _final_task.status == "done":
+                        _final_status = "done"
+                except Exception:
+                    pass
+                _rs.finalize(success=(_final_status == "done"))
+                await _emit(
+                    progress, store, task_id, "run_card",
+                    {"text": _rs.render_telegram(lang=lang), "status": _final_status},
+                )
+        except Exception:
+            pass
         # Stop the healing monitor cleanly on every exit path (return, raise,
         # cancellation). Created lazily inside the try-block; may not exist
         # if we crashed before reaching it.
